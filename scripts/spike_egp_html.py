@@ -1,40 +1,38 @@
 """
-Spike 2: e-GP per-project — discover bidder/winner data via PDF chain
+Spike 2: e-GP per-project — bidder list via getProcureResult JSON
 
-Validates the end-to-end UI flow that reaches the winner-announcement PDF
-(templateType=W13). The bidder list itself lives in two later PDFs (the
-"สรุปข้อมูลการเสนอราคาเบื้องต้น" and "รายงานผลการพิจารณา") which are gated by
-the SPA's W1 modal until the project announces สาระสำคัญในสัญญา. Downloading
-those PDFs reuses the same chain on a project that has progressed further;
-spike 2's job is just to prove the chain works.
+The moat endpoint (verified 2026-05-01):
+  GET egp-atpj27-service/pb/a-egp-allt-project/announcement/getProcureResult?projectId={pid}
 
-Endpoint chain:
-  1. greenBook?mode=LINK&methodId=...&tempProjectId=...&pageAnnounceType=W0
-       → list of announcements (B0/D0/W0/price/BOQ/...)
-  2. infoApproveTemplate?projectId=...&templateType=W13
-       → templateId (UUID)
-  3. view-pdf-file?templateId={uuid}
-       → binary application/pdf
+Returns the full proposal record for a project: every bidder's legal name,
+13-digit TIN, proposal price, pass/fail flag, and (for the winner) the
+agreed contract price. Works across all methodIds (e-bidding, สอบราคา,
+เฉพาะเจาะจง) and budget years 2014→present. No encrypted projectId, no
+template chain, no PDF parsing — only a CDP-warmed Chrome session is needed
+to bypass F5/Cloudflare and inherit cookies for ctx.request.
 
-Prereq: Chrome must be running on CDP port 9231 with a fresh profile under
-chrome_profile/. The script connects via playwright.connect_over_cdp.
+Earlier rounds of this spike chased PDF endpoints (greenBook →
+infoApproveTemplate → view-pdf-file) before discovering getProcureResult.
+Those are kept in `reference_egp_endpoints.md` as fallbacks; the JSON path
+is dramatically simpler and is the primary ingestion channel for phase 1.
+
+Prereq:
+  Chrome must be running on CDP port 9231 with the project's chrome_profile/.
+  The session must have hit /announcement at least once.
 
 Usage:
-  python scripts/spike_egp_html.py            # find first e-bidding winner-announce
-                                              # project of the day, dump greenBook + W13 PDF
+  python scripts/spike_egp_html.py            # find one fresh e-bidding winner-announce
+                                              # project, then dump its full bidder list
 
 Output (data/):
-  - egp_recent_projects.json    e-bidding winner-announce projects of the day
-  - egp_greenbook_<pid>.json    full greenBook listLINK response
-  - egp_winner_<pid>.pdf        the W13 PDF
-  - egp_template_<pid>.json     infoApproveTemplate metadata
+  - egp_recent_projects.json    candidate projects from the search step
+  - egp_procure_result_<pid>.json   getProcureResult body for the picked project
 """
 from __future__ import annotations
 
 import json
 import sys
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
 
 from playwright.sync_api import sync_playwright
 
@@ -49,9 +47,8 @@ CDP = "http://127.0.0.1:9231"
 WEB = "https://process5.gprocurement.go.th/egp-agpc01-web/announcement"
 HOST = "https://process5.gprocurement.go.th"
 
-GREENBOOK = HOST + "/egp-atpj27-service/pb/a-egp-allt-project/announcement/greenBook"
-INFO_TPL = HOST + "/egp-approval-service/apv-common/infoApproveTemplate"
-VIEW_PDF = HOST + "/egp-template-service/dwnt/view-pdf-file"
+SEARCH_API = HOST + "/egp-atpj27-service/pb/a-egp-allt-project/announcement"
+PROCURE_RESULT = SEARCH_API + "/getProcureResult"
 
 
 def find_or_open_announcement_tab(ctx):
@@ -67,146 +64,74 @@ def find_or_open_announcement_tab(ctx):
     return pg
 
 
-def pick_ngselect(page, placeholder: str, want: list[str]) -> bool:
-    sel = None
-    for el in page.query_selector_all("ng-select"):
-        try:
-            if placeholder in (el.inner_text() or ""):
-                sel = el
-                break
-        except Exception:
-            continue
-    if sel is None:
-        return False
-    try:
-        sel.click(timeout=4000)
-    except Exception:
-        sel.click(timeout=4000, force=True)
-    page.wait_for_timeout(700)
-    for opt in page.query_selector_all(".ng-dropdown-panel .ng-option"):
-        try:
-            t = opt.inner_text().strip()
-        except Exception:
-            continue
-        if any(w in t for w in want):
-            opt.click()
-            page.wait_for_timeout(400)
-            return True
-    page.keyboard.press("Escape")
-    return False
-
-
-def open_winner_ebidding_project(page) -> str | None:
-    """Drive the SPA: advanced search → ประเภทประกาศ=ประกาศผู้ชนะ + วิธีการจัดหา=e-bidding,
-    click ค้นหา, then click the first valid result row. Returns the encrypted
-    procurement URL on success, None on failure.
-    """
+def capture_token(page) -> str | None:
+    """Trigger a search and read the announcementToken the SPA writes to sessionStorage."""
     try:
         page.bring_to_front()
     except Exception:
         pass
-
-    # open advanced search if its modal isn't already showing
-    if not page.query_selector("div.modal.fade.show[aria-modal='true']"):
-        adv = page.query_selector("button:has-text('ค้นหาขั้นสูง')")
-        if adv:
-            try:
-                adv.click(timeout=4000)
-            except Exception:
-                adv.click(timeout=4000, force=True)
-            page.wait_for_timeout(1200)
-
-    if not pick_ngselect(page, "เลือกประเภทประกาศ", ["ประกาศรายชื่อผู้ชนะการเสนอราคา"]):
-        print("   [!] couldn't set ประเภทประกาศ")
-        return None
-    if not pick_ngselect(page, "เลือกวิธีการจัดหา", ["ประกวดราคาอิเล็กทรอนิกส์ (e-bidding)"]):
-        print("   [!] couldn't set วิธีการจัดหา (continuing anyway)")
-
-    btn = (
-        page.query_selector("div.modal.fade.show button:has-text('ค้นหา')")
-        or page.query_selector("button:has-text('ค้นหา')")
-    )
-    try:
-        btn.click(timeout=5000)
-    except Exception:
-        btn.click(timeout=5000, force=True)
-    page.wait_for_timeout(7000)
-    try:
-        page.wait_for_load_state("networkidle", timeout=8000)
-    except Exception:
-        pass
-
-    rows = page.query_selector_all("table tbody tr")
-    target = None
-    for r in rows:
+    btn = page.query_selector("button:has-text('ค้นหา')")
+    if btn and btn.is_enabled():
         try:
-            txt = (r.inner_text() or "").strip()
-            if not r.is_visible() or len(txt) < 20:
-                continue
-            if "E1530" in txt or "ปฎิเสธ" in txt:
-                continue
-            first = txt.split("\t", 1)[0].strip()
-            if first.isdigit():
-                target = r
-                break
+            btn.click(timeout=4000)
         except Exception:
-            continue
-    if target is None:
-        print("   [!] no winner-announce e-bidding rows found today")
+            pass
+        page.wait_for_timeout(3000)
+    try:
+        raw = page.evaluate("() => sessionStorage.getItem('announcementData')")
+        if not raw:
+            return None
+        obj = json.loads(raw)
+        return ((obj.get("searchForm") or {}).get("announcementToken")) or None
+    except Exception:
         return None
-    icon = target.query_selector("egp-all-button a") or target.query_selector("a.btn-icon")
-    if icon is None:
-        print("   [!] row has no detail-link icon")
-        return None
-    try:
-        icon.scroll_into_view_if_needed(timeout=2000)
-    except Exception:
-        pass
-    try:
-        icon.click(timeout=5000)
-    except Exception:
-        icon.click(timeout=5000, force=True)
-    page.wait_for_timeout(7000)
-    try:
-        page.wait_for_load_state("networkidle", timeout=8000)
-    except Exception:
-        pass
-    return page.url if "/procurement/" in page.url else None
 
 
-def fetch_greenbook(ctx, pid: str, method_id: str = "16") -> dict:
+def search_recent(ctx, token: str, budget_year: str = "2569", page_num: int = 1) -> list[dict]:
     r = ctx.request.get(
-        GREENBOOK,
+        SEARCH_API,
         params={
-            "mode": "LINK",
-            "methodId": method_id,
-            "tempProjectId": pid,
-            "pageAnnounceType": "W0",
+            "budgetYear": budget_year,
+            "announcementTodayFlag": "false",
+            "page": str(page_num),
+            "announcementToken": token,
         },
         headers={"Referer": WEB, "Accept": "application/json"},
     )
-    return r.json() if "json" in r.headers.get("content-type", "") else {"_status": r.status}
+    if r.status != 200 or "json" not in r.headers.get("content-type", ""):
+        return []
+    j = r.json()
+    return (j.get("data") or {}).get("data") or []
 
 
-def fetch_template_and_pdf(ctx, pid: str, template_type: str = "W13") -> tuple[dict, bytes | None]:
-    r1 = ctx.request.get(
-        INFO_TPL,
-        params={"projectId": pid, "templateType": template_type},
+def fetch_procure_result(ctx, pid: str) -> dict:
+    r = ctx.request.get(
+        PROCURE_RESULT,
+        params={"projectId": pid},
         headers={"Referer": WEB, "Accept": "application/json"},
     )
-    meta = r1.json()
-    tid = (meta.get("data") or {}).get("templateId")
-    if not tid:
-        return meta, None
-    r2 = ctx.request.get(
-        VIEW_PDF,
-        params={"templateId": tid},
-        headers={"Referer": WEB, "Accept": "application/pdf,*/*"},
-    )
-    body = r2.body()
-    if not body.startswith(b"%PDF"):
-        return meta, None
-    return meta, body
+    if r.status != 200:
+        return {"_status": r.status, "_body": r.text()[:300]}
+    try:
+        return r.json()
+    except Exception as e:
+        return {"_parse_error": str(e), "_body": r.text()[:300]}
+
+
+def summarize(result: dict) -> None:
+    data = result.get("data") or {}
+    groups = data.get("procureResultList") or []
+    print(f"   procureResultList: {len(groups)} consider-group(s)")
+    for grp in groups:
+        bidders = grp.get("procureResultDataResponse") or []
+        print(f"   group: {(grp.get('considerDesc') or '')[:80]!r}  bidders={len(bidders)}")
+        for bd in bidders:
+            mark = "★" if bd.get("priceAgree") else " "
+            name = (bd.get("receiveNameTh") or "")[:42]
+            tin = bd.get("receiveTin") or ""
+            price = bd.get("priceProposal")
+            flag = bd.get("resultFlag")
+            print(f"     {mark} {name:<42} tin={tin:<14} price={price}  flag={flag}")
 
 
 def main() -> int:
@@ -217,55 +142,59 @@ def main() -> int:
         page = find_or_open_announcement_tab(ctx)
         print(f"[+] using tab: {page.url}")
 
-        proc_url = open_winner_ebidding_project(page)
-        if proc_url is None:
-            print("[!] could not reach a /procurement/{enc} page")
+        token = capture_token(page)
+        if not token:
+            print("[!] failed to capture announcementToken (open the SPA and click ค้นหา manually, then re-run)")
             return 1
-        print(f"[+] procurement detail: {proc_url}")
+        print(f"[+] token len={len(token)}")
 
-        # The SPA stores the resolved projectId in the page's stored greenBook
-        # response; the tab also exposes it inside text on the page.
-        body_text = page.inner_text("body")
-        # ลองหา "เลขที่โครงการ" column
-        pid = None
-        for line in body_text.splitlines():
-            ln = line.strip()
-            if ln.isdigit() and 10 <= len(ln) <= 14:
-                pid = ln
+        # Pull a few candidate projects across recent budget years.
+        candidates: list[dict] = []
+        for by in ("2569", "2568"):
+            items = search_recent(ctx, token, budget_year=by, page_num=1)
+            print(f"    budgetYear={by}: {len(items)} items")
+            candidates.extend(items)
+            if len(candidates) >= 10:
                 break
-        if pid is None:
-            # fall back to extracting from the page text after the label
-            import re
-            m = re.search(r"เลขที่โครงการ\s+(\d{10,14})", body_text)
-            if m:
-                pid = m.group(1)
-        if pid is None:
-            print("[!] couldn't extract projectId from the detail page text")
+
+        # prefer e-bidding (methodId=16) since เฉพาะเจาะจง has only 1 bidder by design
+        ebidding = [c for c in candidates if str(c.get("methodId")) == "16"]
+        pool = ebidding or candidates
+        if not pool:
+            print("[!] no candidates")
             return 2
-        print(f"[+] projectId = {pid}")
 
-        gb = fetch_greenbook(ctx, pid, method_id="16")
-        (DATA / f"egp_greenbook_{pid}.json").write_text(
-            json.dumps(gb, ensure_ascii=False, indent=2), encoding="utf-8"
+        (DATA / "egp_recent_projects.json").write_text(
+            json.dumps([{
+                "projectId": c.get("projectId"),
+                "projectName": (c.get("projectName") or "")[:160],
+                "methodId": c.get("methodId"),
+                "stepId": c.get("stepId"),
+                "flowName": c.get("flowName"),
+                "deptSubName": c.get("deptSubName"),
+            } for c in candidates], ensure_ascii=False, indent=2),
+            encoding="utf-8",
         )
-        items = ((gb.get("data") or {}).get("greenBookAnnouncementTypeLinkDto") or [])
-        print(f"[+] greenBook returned {len(items)} announcement(s):")
-        for it in items:
-            print(f"    type={it.get('announceType'):<6} desc={(it.get('announceTypeDesc') or '')[:50]}")
+        print(f"[+] saved {len(candidates)} candidates -> data/egp_recent_projects.json")
 
-        meta, pdf = fetch_template_and_pdf(ctx, pid, template_type="W13")
-        (DATA / f"egp_template_{pid}.json").write_text(
-            json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-        if pdf:
-            out = DATA / f"egp_winner_{pid}.pdf"
-            out.write_bytes(pdf)
-            print(f"[+] saved W13 PDF -> {out}  ({len(pdf):,} bytes)")
-        else:
-            print(f"[!] no PDF returned for templateType=W13 / pid={pid}")
-            print(f"    meta response: {json.dumps(meta, ensure_ascii=False)[:300]}")
+        # Probe up to 3 different projects so we see realistic shape variation
+        for c in pool[:3]:
+            pid = str(c.get("projectId") or "")
+            if not pid:
+                continue
+            print(f"\n--- pid={pid}  methodId={c.get('methodId')}  flow={c.get('flowName')} ---")
+            result = fetch_procure_result(ctx, pid)
+            (DATA / f"egp_procure_result_{pid}.json").write_text(
+                json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            rc = (result.get("response") or {}).get("responseCode")
+            if rc != "0":
+                desc = (result.get("response") or {}).get("description")
+                print(f"   responseCode={rc} desc={desc!r}")
+                continue
+            summarize(result)
 
-    print("\n[+] spike 2 done — feed the PDF into spike_pdf_ocr.py to extract winner+price.")
+    print("\n[+] spike 2 done. getProcureResult is the primary bidder-list endpoint.")
     return 0
 
 
