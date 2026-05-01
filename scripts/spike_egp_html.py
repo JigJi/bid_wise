@@ -1,25 +1,32 @@
 """
-Spike 2: e-GP per-project HTML — extract bidder list
+Spike 2: e-GP per-project — discover the bidder list endpoint
 
-Goal: verify that process3.gprocurement.go.th project detail HTML is fetchable
-without login and that bidder list is parseable.
+Strategy (validated 2026-05-01):
+  1. Open the public announcement SPA in headless Chromium so the F5 BIG-IP
+     ASM + Cloudflare Turnstile gates issue real cookies + UA.
+  2. Listen for any outbound XHR whose URL contains `announcementToken`,
+     capture the token (it's session-scoped, JS-injected per page load).
+  3. Use the token to call the search API and collect a few recent project IDs
+     across announceType 1 + 2.
+  4. For each candidate pid, open its detail page in the same browser context
+     and intercept *every* JSON XHR — that surfaces whichever endpoint the SPA
+     uses to render the bidder/qualification panel.
 
-Sample URL pattern:
-  https://process3.gprocurement.go.th/egp2procmainWeb/jsp/procsearch.sch
-    ?pid=<PROJECT_ID>&servlet=gojsp&proc_id=ShowHTMLFile&processFlows=Procure
-
-Output: saves raw HTML, lists tables found, attempts to identify bidder section.
-
-Run: python scripts/spike_egp_html.py
+Output:
+  - data/egp_token_sample.json     captured token + cookies (do not commit)
+  - data/egp_recent_projects.json  search-API results
+  - data/egp_detail_<pid>.json     full detail JSON per candidate project
+  - data/egp_detail_<pid>_xhrs.json list of every JSON URL the detail page hit
 """
 from __future__ import annotations
 
-import re
+import json
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
-import requests
-from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright
 
 sys.stdout.reconfigure(encoding="utf-8")
 sys.stderr.reconfigure(encoding="utf-8")
@@ -28,118 +35,174 @@ ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = ROOT / "data"
 DATA_DIR.mkdir(exist_ok=True)
 
-# Sample project IDs — try a few; replace with known recent e-bidding pids if needed
-SAMPLE_PIDS = [
-    "68119188722",  # from research agent's confirmed-working sample
-]
-
-BASE = "https://process3.gprocurement.go.th/egp2procmainWeb/jsp/procsearch.sch"
-UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
-
-# Thai keywords that mark the bidder section in รายงานผลการพิจารณา-style pages
-BIDDER_KEYWORDS = [
-    "ผู้เสนอราคา",
-    "ผู้ยื่นข้อเสนอ",
-    "ผู้ยื่นซอง",
-    "รายชื่อผู้",
-    "ผู้ผ่านคุณสมบัติ",
-    "ผู้ชนะ",
-    "ราคาที่เสนอ",
-]
+WEB = "https://process5.gprocurement.go.th/egp-agpc01-web/announcement"
+SEARCH_API = "https://process5.gprocurement.go.th/egp-atpj27-service/pb/a-egp-allt-project/announcement"
+SUMMARY_API = SEARCH_API + "/sumProjectMoneyAndCount"
+DETAIL_API = SEARCH_API + "/getProcurementDetail"
 
 
-def fetch_project_html(pid: str) -> str | None:
+def capture_token(page) -> str | None:
+    """Listen for any request whose URL carries an announcementToken query param."""
+    captured: list[str] = []
+
+    def on_req(req):
+        if "announcementToken" in req.url:
+            qs = parse_qs(urlparse(req.url).query)
+            tok = qs.get("announcementToken", [None])[0]
+            if tok and tok not in captured:
+                captured.append(tok)
+
+    page.on("request", on_req)
+    return captured
+
+
+def search_recent(ctx, token: str, day: str, atype: str = "2", page_num: int = 1) -> list[dict]:
     params = {
-        "pid": pid,
-        "servlet": "gojsp",
-        "proc_id": "ShowHTMLFile",
-        "processFlows": "Procure",
+        "announceType": atype,
+        "announceSDate": day,
+        "announceEDate": day,
+        "announcementTodayFlag": "false",
+        "page": str(page_num),
+        "announcementToken": token,
     }
-    url = BASE
-    print(f"\n[+] GET {url}?pid={pid}&...")
+    r = ctx.request.get(SEARCH_API, params=params, headers={"Referer": WEB, "Accept": "application/json"})
+    if r.status != 200 or "json" not in r.headers.get("content-type", ""):
+        print(f"   [!] search returned status={r.status} ct={r.headers.get('content-type')}")
+        return []
+    j = r.json()
+    return (j.get("data") or {}).get("data") or []
+
+
+def fetch_detail(ctx, pid: str) -> dict:
+    r = ctx.request.get(f"{DETAIL_API}?projectId={pid}", headers={"Referer": WEB, "Accept": "application/json"})
+    if r.status != 200:
+        return {"_status": r.status, "_body": r.text()[:300]}
     try:
-        r = requests.get(url, params=params, headers=UA, timeout=30, verify=False)
-        print(f"    status={r.status_code} bytes={len(r.content):,} encoding={r.encoding}")
-        if r.status_code != 200:
-            return None
-        return r.text
+        return r.json()
     except Exception as e:
-        print(f"    [!] fetch failed: {e}")
-        return None
+        return {"_parse_error": str(e), "_body": r.text()[:300]}
 
 
-def analyze_html(html: str) -> dict:
-    soup = BeautifulSoup(html, "lxml")
-    info = {
-        "title": (soup.title.string or "").strip() if soup.title else "",
-        "tables": len(soup.find_all("table")),
-        "links": len(soup.find_all("a")),
-        "pdf_links": [],
-        "bidder_keyword_hits": {},
-        "iframe_count": len(soup.find_all("iframe")),
-    }
+def probe_detail_page(ctx, pid: str) -> list[dict]:
+    """Open the detail SPA page and capture every JSON XHR it fires."""
+    detail_url = f"{WEB}/detail/{pid}"
+    page = ctx.new_page()
+    xhrs: list[dict] = []
 
-    for a in soup.find_all("a", href=True):
-        h = a["href"]
-        if h.lower().endswith(".pdf") or "pdf" in h.lower():
-            info["pdf_links"].append({"href": h, "text": a.get_text(strip=True)[:80]})
+    def on_resp(resp):
+        u = resp.url
+        ct = resp.headers.get("content-type", "")
+        if "gprocurement" in u and "json" in ct:
+            try:
+                body = resp.body()
+                size = len(body)
+            except Exception:
+                size = -1
+            xhrs.append({
+                "url": u,
+                "method": resp.request.method,
+                "status": resp.status,
+                "size": size,
+                "path": urlparse(u).path,
+                "params": list(parse_qs(urlparse(u).query).keys()),
+            })
 
-    text = soup.get_text(" ", strip=True)
-    for kw in BIDDER_KEYWORDS:
-        cnt = text.count(kw)
-        if cnt:
-            info["bidder_keyword_hits"][kw] = cnt
-
-    return info
-
-
-def find_bidder_table(html: str) -> list[list[str]] | None:
-    """Look for an HTML table that mentions bidder keywords + try to extract rows."""
-    soup = BeautifulSoup(html, "lxml")
-    for tbl in soup.find_all("table"):
-        tbl_text = tbl.get_text(" ", strip=True)
-        if any(kw in tbl_text for kw in ("ผู้เสนอราคา", "ผู้ยื่น", "ผู้ผ่านคุณสมบัติ")):
-            rows = []
-            for tr in tbl.find_all("tr"):
-                cells = [td.get_text(" ", strip=True) for td in tr.find_all(["td", "th"])]
-                if cells:
-                    rows.append(cells)
-            return rows
-    return None
+    page.on("response", on_resp)
+    print(f"   [+] opening detail page for pid={pid}")
+    try:
+        page.goto(detail_url, wait_until="domcontentloaded", timeout=45000)
+        page.wait_for_timeout(8000)
+    except Exception as e:
+        print(f"   [!] navigation error: {e}")
+    page.close()
+    return xhrs
 
 
 def main() -> int:
-    requests.packages.urllib3.disable_warnings()  # type: ignore
+    print(f"[+] launching headless browser, warming session against {WEB}")
+    with sync_playwright() as p:
+        b = p.chromium.launch(headless=True)
+        ctx = b.new_context(locale="th-TH")
+        page = ctx.new_page()
 
-    for pid in SAMPLE_PIDS:
-        html = fetch_project_html(pid)
-        if not html:
-            print(f"    [!] no HTML for pid={pid}")
-            continue
+        captured = capture_token(page)
+        page.goto(WEB, wait_until="domcontentloaded", timeout=45000)
+        # SPA fires a few requests on initial render — give it a couple seconds
+        page.wait_for_timeout(6000)
 
-        out_path = DATA_DIR / f"egp_project_{pid}.html"
-        out_path.write_text(html, encoding="utf-8")
-        print(f"    saved -> {out_path}")
+        # If the page still hasn't fired a token-bearing XHR, force one by
+        # calling the bypasscloudflare endpoint via the page.
+        for _ in range(3):
+            if captured:
+                break
+            page.wait_for_timeout(2000)
 
-        info = analyze_html(html)
-        print(f"    title: {info['title'][:120]}")
-        print(f"    tables={info['tables']}  links={info['links']}  iframes={info['iframe_count']}")
-        print(f"    pdf_links: {len(info['pdf_links'])}")
-        for p in info["pdf_links"][:5]:
-            print(f"      - {p['text']:50s} {p['href']}")
-        print(f"    bidder keyword hits: {info['bidder_keyword_hits']}")
+        if not captured:
+            print("[!] failed to capture announcementToken from page traffic")
+            print("    workaround: try clicking a search filter / date input to force XHR")
+            b.close()
+            return 1
 
-        rows = find_bidder_table(html)
-        if rows:
-            print(f"\n    [+] candidate bidder table — {len(rows)} rows:")
-            for i, r in enumerate(rows[:15]):
-                print(f"        row {i}: {r}")
-        else:
-            print("    [!] no bidder-keyword table found in HTML")
-            # Heuristic: dump first 500 chars of body text to see what we got
-            body_text = BeautifulSoup(html, "lxml").get_text(" ", strip=True)
-            print(f"\n    body preview: {body_text[:400]}...")
+        token = captured[0]
+        cookies = ctx.cookies()
+        print(f"[+] captured token (len={len(token)})  cookies={len(cookies)}")
+        (DATA_DIR / "egp_token_sample.json").write_text(
+            json.dumps({"token_len": len(token), "cookies_count": len(cookies)}, indent=2),
+            encoding="utf-8",
+        )
 
+        # Search recent projects. Start with today; if empty, walk back a few days.
+        candidates: list[dict] = []
+        today = datetime.now().date()
+        for offset in range(0, 8):
+            day = (today - timedelta(days=offset)).strftime("%Y-%m-%d")
+            for atype in ("1", "2"):
+                items = search_recent(ctx, token, day, atype=atype, page_num=1)
+                print(f"    {day} type={atype}: {len(items)} items")
+                candidates.extend(items[:5])
+                if len(candidates) >= 10:
+                    break
+            if len(candidates) >= 10:
+                break
+
+        (DATA_DIR / "egp_recent_projects.json").write_text(
+            json.dumps([{
+                "projectId": c.get("projectId"),
+                "projectName": (c.get("projectName") or "")[:120],
+                "announceType": c.get("announceType"),
+                "announceDate": c.get("announceDate"),
+                "flowName": c.get("flowName"),
+                "stepId": c.get("stepId"),
+                "deptSubName": c.get("deptSubName"),
+            } for c in candidates], ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        print(f"\n[+] saved {len(candidates)} candidate(s) -> data/egp_recent_projects.json")
+
+        # Pick up to 3 candidates and probe their detail pages
+        probe_n = min(3, len(candidates))
+        for c in candidates[:probe_n]:
+            pid = str(c.get("projectId"))
+            print(f"\n--- pid={pid}  type={c.get('announceType')}  flow={c.get('flowName')} ---")
+            detail = fetch_detail(ctx, pid)
+            (DATA_DIR / f"egp_detail_{pid}.json").write_text(
+                json.dumps(detail, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            xhrs = probe_detail_page(ctx, pid)
+            (DATA_DIR / f"egp_detail_{pid}_xhrs.json").write_text(
+                json.dumps(xhrs, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            print(f"   captured {len(xhrs)} JSON XHRs:")
+            seen_paths: set[str] = set()
+            for x in xhrs:
+                if x["path"] in seen_paths:
+                    continue
+                seen_paths.add(x["path"])
+                print(f"     {x['status']}  {x['size']:>7}B  {x['path']}")
+
+        b.close()
+
+    print("\n[+] done. inspect data/egp_detail_<pid>_xhrs.json for the bidder endpoint.")
     return 0
 
 
