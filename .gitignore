@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.Python
+venv/
+.venv/
+env/
+
+# Env / secrets
+.env
+.env.local
+*.local
+
+# Data / artifacts (don't commit raw scrapes or model output)
+data/
+logs/
+*.log
+*.sqlite
+*.db
+
+# OCR / model caches
+alma/venv/
+alma/models/
+alma/output/
+alma/uploads/
+
+# Node / Next.js
+node_modules/
+.next/
+out/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Chrome profile (per-project CDP profile)
+chrome_profile/
+*_profile/
+
+# Pipeline state files
+pipeline_state*.json
+*_state.json
+*.tmp
