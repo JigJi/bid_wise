@@ -1,6 +1,5 @@
 import type { Metadata } from "next";
 import { Inter, IBM_Plex_Sans_Thai } from "next/font/google";
-import { ThemeProvider } from "@/components/theme-provider";
 import { Topbar } from "@/components/topbar";
 import "./globals.css";
 
@@ -27,21 +26,14 @@ export default function RootLayout({
   children,
 }: Readonly<{ children: React.ReactNode }>) {
   return (
-    <html lang="th" suppressHydrationWarning>
+    <html lang="th">
       <body
         className={`${inter.variable} ${plexThai.variable} font-sans min-h-screen antialiased`}
       >
-        <ThemeProvider
-          attribute="class"
-          defaultTheme="dark"
-          enableSystem
-          disableTransitionOnChange
-        >
-          <div className="flex min-h-screen flex-col">
-            <Topbar />
-            <main className="flex-1">{children}</main>
-          </div>
-        </ThemeProvider>
+        <div className="flex min-h-screen flex-col">
+          <Topbar />
+          <main className="flex-1">{children}</main>
+        </div>
       </body>
     </html>
   );
