@@ -2,10 +2,11 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.config import settings
+from app.api.v1 import router as v1_router
 
 app = FastAPI(
     title="BidWise API",
-    description="Thai gov procurement bidder analytics",
+    description="Thai gov procurement vendor copilot",
     version="0.1.0",
 )
 
@@ -17,6 +18,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.include_router(v1_router)
+
 
 @app.get("/")
 def root():
@@ -24,6 +27,7 @@ def root():
         "service": "bid_wise",
         "env": settings.APP_ENV,
         "status": "ok",
+        "api_docs": "/docs",
     }
 
 

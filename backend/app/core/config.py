@@ -3,8 +3,10 @@ import urllib.parse
 from dotenv import load_dotenv
 from pathlib import Path
 
-env_path = Path(".") / ".env"
-load_dotenv(dotenv_path=env_path)
+# Resolve .env path relative to the repo root regardless of cwd
+# (CLI runs from project root; uvicorn typically runs from backend/).
+_PROJECT_ROOT = Path(__file__).resolve().parents[3]
+load_dotenv(dotenv_path=_PROJECT_ROOT / ".env")
 
 
 class Settings:
