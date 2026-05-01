@@ -5,6 +5,7 @@ from app.models.project import Project
 from app.models.announcement import Announcement
 from app.models.bidder import Bidder, JointVentureMember
 from app.models.document import DocumentZip, DocumentFile, PdfTemplate
+from app.models.tor_analysis import TorAnalysis
 
 __all__ = [
     "Department",
@@ -17,4 +18,5 @@ __all__ = [
     "DocumentZip",
     "DocumentFile",
     "PdfTemplate",
+    "TorAnalysis",
 ]
